@@ -104,7 +104,7 @@ npm install
 4. Inicie o servidor:
 
 ```bash
-node index.js
+node app.js
 ```
 
 ---
