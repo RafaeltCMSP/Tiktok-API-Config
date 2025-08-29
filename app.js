@@ -2,10 +2,49 @@ const express = require('express');
 const axios = require('axios');
 const crypto = require('crypto');
 const session = require('express-session');
+const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// Configuração do banco SQLite
+const db = new sqlite3.Database('./tiktok_app.db');
+
+// Criar tabelas se não existirem
+db.serialize(() => {
+    db.run(`CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        open_id TEXT UNIQUE,
+        union_id TEXT,
+        display_name TEXT,
+        avatar_url TEXT,
+        access_token TEXT,
+        refresh_token TEXT,
+        expires_in INTEGER,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
+    
+    db.run(`CREATE TABLE IF NOT EXISTS videos (
+        id TEXT PRIMARY KEY,
+        user_open_id TEXT,
+        title TEXT,
+        description TEXT,
+        cover_image_url TEXT,
+        share_url TEXT,
+        duration INTEGER,
+        width INTEGER,
+        height INTEGER,
+        like_count INTEGER,
+        comment_count INTEGER,
+        share_count INTEGER,
+        view_count INTEGER,
+        create_time INTEGER,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_open_id) REFERENCES users (open_id)
+    )`);
+});
 
 // Configurações da API do TikTok
 const TIKTOK_CONFIG = {
@@ -13,6 +52,7 @@ const TIKTOK_CONFIG = {
     CLIENT_SECRET: 'f0hRBTxI8xLdr8UZ8vlZEZq8IsEASQkd',
     BASE_URL: 'https://cuddly-guide-vp6r979xrwrcwv75-3000.app.github.dev',
     REDIRECT_URI: 'https://cuddly-guide-vp6r979xrwrcwv75-3000.app.github.dev/auth/callback',
+    // CORREÇÃO: Apenas scopes disponíveis no sandbox
     SCOPE: 'user.info.basic,video.list'
 };
 
@@ -34,7 +74,7 @@ app.use(session({
     secret: 'tiktok-test-secret-key',
     resave: false,
     saveUninitialized: true,
-    cookie: { secure: false } // Para desenvolvimento local
+    cookie: { secure: false }
 }));
 
 // Função para gerar state aleatório (CSRF protection)
@@ -51,6 +91,35 @@ function generatePKCE() {
         codeVerifier,
         codeChallenge
     };
+}
+
+// Função para salvar usuário no banco
+function saveUserToDB(userData, tokens) {
+    return new Promise((resolve, reject) => {
+        const stmt = db.prepare(`
+            INSERT OR REPLACE INTO users 
+            (open_id, union_id, display_name, avatar_url, access_token, refresh_token, expires_in, updated_at) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+        `);
+        
+        stmt.run([
+            userData.open_id,
+            userData.union_id || null,
+            userData.display_name || null,
+            userData.avatar_url || null,
+            tokens.access_token,
+            tokens.refresh_token || null,
+            tokens.expires_in || null
+        ], function(err) {
+            if (err) {
+                reject(err);
+            } else {
+                resolve(this.lastID);
+            }
+        });
+        
+        stmt.finalize();
+    });
 }
 
 // Página inicial
@@ -113,9 +182,9 @@ app.get('/', (req, res) => {
                 background: rgba(76, 175, 80, 0.3); 
                 border-left: 4px solid #4CAF50;
             }
-            .error { 
-                background: rgba(244, 67, 54, 0.3); 
-                border-left: 4px solid #f44336;
+            .warning { 
+                background: rgba(255, 193, 7, 0.3); 
+                border-left: 4px solid #ffc107;
             }
         </style>
     </head>
@@ -129,10 +198,13 @@ app.get('/', (req, res) => {
                     ✅ Servidor rodando na porta ${PORT}
                 </div>
                 <div class="status success">
-                    ✅ Client Key configurado: ${TIKTOK_CONFIG.CLIENT_KEY}
+                    ✅ Client Key: ${TIKTOK_CONFIG.CLIENT_KEY}
                 </div>
                 <div class="status success">
-                    ✅ Redirect URI: ${TIKTOK_CONFIG.REDIRECT_URI}
+                    ✅ SQLite Database conectado
+                </div>
+                <div class="status warning">
+                    ⚠️ Scopes: ${TIKTOK_CONFIG.SCOPE}
                 </div>
             </div>
 
@@ -140,6 +212,7 @@ app.get('/', (req, res) => {
                 <a href="/auth/login" class="btn">🚀 Iniciar Autenticação TikTok</a>
                 <a href="/test/config" class="btn">⚙️ Testar Configuração</a>
                 <a href="/dashboard" class="btn">📊 Dashboard</a>
+                <a href="/db/users" class="btn">👥 Ver Usuários do DB</a>
             </div>
 
             <div class="info">
@@ -150,7 +223,7 @@ app.get('/', (req, res) => {
                     <li><strong>GET /auth/callback</strong> - Callback da autenticação</li>
                     <li><strong>GET /user/info</strong> - Informações do usuário autenticado</li>
                     <li><strong>GET /user/videos</strong> - Lista de vídeos do usuário</li>
-                    <li><strong>GET /test/config</strong> - Testa a configuração</li>
+                    <li><strong>GET /db/users</strong> - Usuários salvos no banco</li>
                     <li><strong>GET /dashboard</strong> - Painel de controle</li>
                 </ul>
             </div>
@@ -243,6 +316,23 @@ app.get('/auth/callback', async (req, res) => {
         
         console.log('✅ Token obtido com sucesso!');
         
+        // Tentar obter informações básicas do usuário e salvar no banco
+        try {
+            const userInfoResponse = await axios.get(TIKTOK_API.USER_INFO + '?fields=open_id,union_id,avatar_url,display_name', {
+                headers: {
+                    'Authorization': `Bearer ${tokenResponse.data.access_token}`,
+                    'Content-Type': 'application/json'
+                }
+            });
+            
+            if (userInfoResponse.data.data) {
+                await saveUserToDB(userInfoResponse.data.data, tokenResponse.data);
+                console.log('✅ Usuário salvo no banco de dados');
+            }
+        } catch (userError) {
+            console.log('⚠️ Não foi possível salvar usuário no banco:', userError.message);
+        }
+        
         // Redirecionar para dashboard
         res.redirect('/dashboard?success=true');
         
@@ -318,10 +408,6 @@ app.get('/dashboard', (req, res) => {
                 background: rgba(244, 67, 54, 0.3); 
                 border-left: 4px solid #f44336;
             }
-            .info { 
-                background: rgba(33, 150, 243, 0.3); 
-                border-left: 4px solid #2196F3;
-            }
             .grid { 
                 display: grid; 
                 grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); 
@@ -385,6 +471,13 @@ app.get('/dashboard', (req, res) => {
                     </div>
                     
                     <div class="card">
+                        <h3>💾 Banco de Dados</h3>
+                        <button class="btn secondary" onclick="makeRequest('/db/users')">
+                            Ver Usuários
+                        </button>
+                    </div>
+                    
+                    <div class="card">
                         <h3>🔑 Token Info</h3>
                         <button class="btn secondary" onclick="makeRequest('/auth/token-info')">
                             Ver Token
@@ -394,7 +487,7 @@ app.get('/dashboard', (req, res) => {
                     <div class="card">
                         <h3>🚪 Sair</h3>
                         <a href="/auth/logout" class="btn" style="background: #f44336;">
-                            Fazer Logout
+                            Logout
                         </a>
                     </div>
                 </div>
@@ -420,16 +513,23 @@ app.get('/dashboard', (req, res) => {
     res.send(html);
 });
 
-// Informações do usuário
+// CORREÇÃO: Informações do usuário (apenas campos disponíveis no sandbox)
 app.get('/user/info', async (req, res) => {
     try {
         if (!req.session.accessToken) {
             return res.status(401).json({ error: 'Token de acesso não encontrado' });
         }
         
-        const response = await axios.post(TIKTOK_API.USER_INFO, {
-            fields: ['open_id', 'union_id', 'avatar_url', 'display_name', 'bio_description', 'profile_deep_link', 'is_verified', 'follower_count', 'following_count', 'likes_count', 'video_count']
-        }, {
+        // Apenas campos básicos disponíveis no sandbox
+        const fields = ['open_id', 'union_id', 'avatar_url', 'display_name'];
+        
+        const url = new URL(TIKTOK_API.USER_INFO);
+        url.searchParams.append('fields', fields.join(','));
+        
+        console.log('🔍 Fazendo requisição para:', url.toString());
+        console.log('🔑 Token sendo usado:', req.session.accessToken.substring(0, 20) + '...');
+        
+        const response = await axios.get(url.toString(), {
             headers: {
                 'Authorization': `Bearer ${req.session.accessToken}`,
                 'Content-Type': 'application/json'
@@ -441,24 +541,40 @@ app.get('/user/info', async (req, res) => {
         
     } catch (error) {
         console.error('❌ Erro ao obter informações do usuário:', error.response?.data || error.message);
+        
+        // Log detalhado do erro para debug
+        if (error.response) {
+            console.error('Status:', error.response.status);
+            console.error('Headers:', error.response.headers);
+            console.error('Data:', error.response.data);
+        }
+        
         res.status(500).json({ 
             error: 'Erro ao obter informações do usuário', 
-            details: error.response?.data || error.message 
+            details: error.response?.data || error.message,
+            status: error.response?.status,
+            endpoint: TIKTOK_API.USER_INFO
         });
     }
 });
 
-// Vídeos do usuário
+// Não disponivel no modo sandbox
 app.get('/user/videos', async (req, res) => {
     try {
         if (!req.session.accessToken) {
             return res.status(401).json({ error: 'Token de acesso não encontrado' });
         }
         
-        const response = await axios.post(TIKTOK_API.VIDEO_LIST, {
-            max_count: 20,
-            fields: ['id', 'create_time', 'cover_image_url', 'share_url', 'video_description', 'duration', 'height', 'width', 'title', 'embed_html', 'embed_link', 'like_count', 'comment_count', 'share_count', 'view_count']
-        }, {
+        const fields = ['id', 'create_time', 'cover_image_url', 'share_url', 'video_description', 'duration', 'height', 'width', 'title'];
+        
+        const url = new URL(TIKTOK_API.VIDEO_LIST);
+        url.searchParams.append('fields', fields.join(','));
+        url.searchParams.append('max_count', '20');
+        
+        console.log('🔍 Fazendo requisição para vídeos:', url.toString());
+        console.log('🔑 Token sendo usado:', req.session.accessToken.substring(0, 20) + '...');
+        
+        const response = await axios.get(url.toString(), {
             headers: {
                 'Authorization': `Bearer ${req.session.accessToken}`,
                 'Content-Type': 'application/json'
@@ -470,11 +586,51 @@ app.get('/user/videos', async (req, res) => {
         
     } catch (error) {
         console.error('❌ Erro ao obter vídeos:', error.response?.data || error.message);
+        
+        // Log detalhado do erro para debug
+        if (error.response) {
+            console.error('Status:', error.response.status);
+            console.error('Headers:', error.response.headers);
+            console.error('Data:', error.response.data);
+        }
+        
         res.status(500).json({ 
             error: 'Erro ao obter vídeos', 
-            details: error.response?.data || error.message 
+            details: error.response?.data || error.message,
+            status: error.response?.status,
+            endpoint: TIKTOK_API.VIDEO_LIST
         });
     }
+});
+
+// Ver usuários do banco de dados
+app.get('/db/users', (req, res) => {
+    db.all("SELECT * FROM users ORDER BY created_at DESC", [], (err, rows) => {
+        if (err) {
+            console.error('❌ Erro ao consultar banco:', err);
+            res.status(500).json({ error: 'Erro ao consultar banco', details: err.message });
+            return;
+        }
+        
+        // Remover tokens sensíveis da resposta
+        const safeRows = rows.map(row => ({
+            id: row.id,
+            open_id: row.open_id,
+            union_id: row.union_id,
+            display_name: row.display_name,
+            avatar_url: row.avatar_url,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+            has_access_token: !!row.access_token,
+            has_refresh_token: !!row.refresh_token
+        }));
+        
+        res.json({
+            message: 'Usuários do banco de dados',
+            count: safeRows.length,
+            users: safeRows
+        });
+    });
 });
 
 // Informações do token
@@ -488,7 +644,8 @@ app.get('/auth/token-info', (req, res) => {
         tokenType: req.session.tokenType || 'Bearer',
         expiresIn: req.session.expiresIn,
         hasRefreshToken: !!req.session.refreshToken,
-        tokenPreview: req.session.accessToken.substring(0, 10) + '...'
+        tokenPreview: req.session.accessToken.substring(0, 10) + '...',
+        scopes: TIKTOK_CONFIG.SCOPE
     });
 });
 
@@ -529,7 +686,8 @@ app.get('/health', (req, res) => {
         status: 'OK',
         timestamp: new Date().toISOString(),
         uptime: process.uptime(),
-        environment: process.env.NODE_ENV || 'development'
+        environment: process.env.NODE_ENV || 'development',
+        database: 'SQLite conectado'
     });
 });
 
@@ -562,18 +720,21 @@ app.listen(PORT, '0.0.0.0', () => {
     console.log(`🔧 Porta: ${PORT}`);
     console.log(`🔑 Client Key: ${TIKTOK_CONFIG.CLIENT_KEY}`);
     console.log(`🔄 Redirect URI: ${TIKTOK_CONFIG.REDIRECT_URI}`);
-    console.log(`📋 Scope: ${TIKTOK_CONFIG.SCOPE}`);
+    console.log(`📋 Scopes SANDBOX: ${TIKTOK_CONFIG.SCOPE}`);
+    console.log(`💾 Database: SQLite (tiktok_app.db)`);
     console.log('🚀 =====================================');
     console.log('📚 Endpoints disponíveis:');
     console.log('   GET  / - Página inicial');
     console.log('   GET  /auth/login - Iniciar autenticação');
     console.log('   GET  /auth/callback - Callback OAuth');
     console.log('   GET  /dashboard - Dashboard principal');
-    console.log('   GET  /user/info - Informações do usuário');
-    console.log('   GET  /user/videos - Lista de vídeos');
+    console.log('   GET  /user/info - Informações do usuário (sandbox)');
+    console.log('   GET  /user/videos - Lista de vídeos (sandbox)');
+    console.log('   GET  /db/users - Usuários salvos no SQLite');
     console.log('   GET  /test/config - Testar configuração');
     console.log('   GET  /health - Health check');
     console.log('🚀 =====================================');
+    console.log('⚠️  SANDBOX MODE - Scopes limitados');
     console.log('✅ Pronto para testar a API do TikTok!');
 });
 
